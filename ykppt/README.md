@@ -3,8 +3,7 @@
 > 无网络环境下，用 **Windows PowerShell + PowerPoint COM** 批量生成 / 编辑
 > **含中文**的学术风格 `.pptx` 的 skill。
 
-沉淀自一次真实任务：把一份本科答辩 PPT 改造成学术会议口头报告，并把用户自制的
-**整页框架图**搬进模板页、统一术语、全局调字号。目标机器无网络（`pip` 装不了
+沉淀自一次真实任务.目标机器无网络（`pip` 装不了
 python-pptx / pywin32），也没有 LibreOffice，因此走 PowerShell 直接驱动
 PowerPoint COM 这条路。
 
