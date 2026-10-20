@@ -1,4 +1,203 @@
-# 用 PowerShell COM 生成中文 PPTX 的踩坑总结（交接文档）
+# 踩坑清单（交接文档）
+
+分两部分：
+
+- **A. python-pptx 路线**（当前主路线，`scripts/*.py`）—— 更新到 2026-10
+- **B. PowerShell COM 路线**（旧版，`scripts/com/*.ps1`，仍在用）—— 原始记录，仍然有效
+
+环境：Windows 10 中文版 + Python 3.11 + python-pptx 1.0.2 + PowerPoint 16.0。
+
+---
+
+# A. python-pptx 路线
+
+> 这一节的坑有个共同点：**没有任何一条会抛异常**。文件能存盘、页数正确、
+> 校验脚本也不报错，但 PowerPoint 打不开，或者内容静默错位。
+> 所以每条都记了「怎么发现的」。
+
+## A1. 删页后 `<p14:sectionLst>` 留下悬空 slide id → 文件打不开
+
+现象：`python-pptx` 正常存盘，zip 结构合法、关系表完整、XML 全部可解析，
+但 PowerPoint 弹「PowerPoint could not open the file」，不给任何细节。
+
+原因：`presentation.xml` 里有一段 `<p:extLst>` 存着**分节**信息，
+`<p14:sectionLst><p14:section><p14:sldIdLst>` 逐个列出 slide id。
+只从 `<p:sldIdLst>` 删页、不清理分节列表，就会留下指向已删页的 id。
+
+```python
+P14 = "{http://schemas.microsoft.com/office/powerpoint/2010/main}"
+for section in prs.part._element.iter(P14 + "section"):
+    lst = section.find(P14 + "sldIdLst")
+    live = {sid.get("id") for sid in prs.slides._sldIdLst}
+    for sid in list(lst):
+        if sid.get("id") not in live:
+            lst.remove(sid)
+```
+
+**注意 `sldId.get("id")` 是 `str`，`Slide.slide_id` 是 `int`。**
+两者直接比较永远为 False —— 我第一次修这个 bug 时正是踩在这上面：
+代码"看起来"在清理，实际一个都没删，于是花了两轮才排掉。
+
+怎么发现的：把原文件二分（只 round-trip → 只删页 → 删页+删形状），
+定位到"删页"这一步；再直接读 `presentation.xml` 的 `extLst` 看到 27 个 id 而
+`p:sldIdLst` 只剩 5 个。
+
+## A2. 删形状后 `<p:timing>` 动画轴按 shape id 悬空 → 文件打不开
+
+现象同上，只删页没问题，一删形状就打不开。
+
+原因：`<p:timing>` 里的动画时间轴用 `<p:spTgt spid="N"/>` 引用形状。
+形状删了，引用还在。
+
+```python
+P_NS = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+for t in slide._element.findall(P_NS + "timing"):
+    slide._element.remove(t)
+```
+
+## A3. 深拷贝形状时 `p:tags r:id` 撞上别的 rId → 文件打不开（最阴的一条）
+
+现象：母版里的页型克隆到新页后，**目录页和所有正文页**都打不开，
+**封面和结束页**却能开。看起来像"某些页型有问题"。
+
+原因：原 PPT 的每个形状都绑了形状标签（tag part），XML 长这样：
+
+```xml
+<p:nvSpPr>
+  <p:cNvPr id="5" name="矩形 4"/>
+  <p:nvPr>
+    <p:custDataLst><p:tags r:id="rId1"/></p:custDataLst>
+  </p:nvPr>
+</p:nvSpPr>
+```
+
+`r:id` 是**在新页里重新分配**的。拷贝过去的 `rId1` 在新页关系表里恰好是
+「幻灯片版式」关系——所以**校验 rId 存在也查不出来**，但 `p:tags` 指向
+的是 slideLayout 而不是 tags part，PowerPoint 直接判损坏。
+
+更坑的是：`p:tags` 少了 `r:id` 是非法 XML，不能只删属性，得整块容器删。
+
+```python
+for cd in list(el.iter(qn("p:custDataLst"))):
+    cd.getparent().remove(cd)
+```
+
+标签只是「形状分组/标记」的元数据，渲染无关，整块剥掉最稳。
+
+封面/结束页没有 tag 关系所以能开 —— 这就是"只有某些页型坏"的真相。
+
+怎么发现的：把 9 个页型各建一个单页文件分别试开，拿到 FAIL 集合
+（toc + 全部正文页）；再比对 OK 文件与 FAIL 文件的 `p:nvPr` 内容，
+看到只有 FAIL 那边有 `custDataLst/p:tags`。
+
+## A4. 克隆页时把页码占位符也过滤掉了 → 所有正文页没页码
+
+现象：生成成功、没报错，但每页右下角空白。
+
+原因：`add_slide()` 只会实例化版式里**有 `type` 的**占位符；
+页码占位符在版式里存在，但不会被带进新页的 shape 树。
+于是"过滤掉所有占位符"这个思路把页码一起杀了。
+
+```python
+ph = el.find(".//" + qn("p:ph"))
+if ph is not None and ph.get("type") != "sldNum":
+    continue      # 内容/标题占位符不复制（会撞 idx），页码要复制
+```
+
+## A5. 组合内子形状的名字改不到 → 内容静默不写入
+
+现象：封面「汇报人」永远是模板默认的"某某某"，
+`build_deck.py` 里 `presenter` 字段填了也无效，**且没有任何警告**。
+
+原因：`slide.shapes` 只遍历顶层；「汇报人」文本框在「汇报人组合」这个
+group 里面。给母版打角色名时漏了递归，渲染时按名字找也就找不到。
+
+```python
+def iter_all(shapes):          # 顺序遍历必须穿透 group
+    for sh in shapes:
+        yield sh
+        if sh.shape_type == 6:      # GROUP
+            yield from iter_all(sh.shapes)
+```
+
+**并且**：找不到形状时不要静默 `return None`，要报警。
+静默是这里最危险的失败模式 —— 生成"成功"、页数正确、无异常，
+但那一块其实是模板默认文案。`ykrender._require()` 就是为此而写。
+
+## A6. `<a:ea>` 缺 `charset="-122"` → 中文少一个字就多折一行
+
+现象：结尾页「请各位老师同学批评指正！」的 `！` 单独掉到第二行，
+正好压在下面的分隔线上，看起来像一根竖线加一个点。
+
+原因：`<a:ea typeface="微软雅黑" charset="-122"/>` 里的 `charset`
+是 GB2312 的中文字符集标识。只写 `typeface`，PowerPoint 会挑到另一款
+**更宽**的 CJK 字形，同样 48pt 的文字就多折一行。
+
+另外 `rPr` 上要带 `lang="zh-CN"`，中文标点悬挂/压缩规则才会生效：
+
+```python
+rPr.set("lang", "zh-CN")
+rPr.set("altLang", "en-US")
+ea.set("typeface", "微软雅黑")
+ea.set("charset", "-122")
+```
+
+顺带记一条 schema 约束：`a:rPr` 的子元素是**有序**的
+（`a:solidFill` → `a:latin` → `a:ea` → `a:cs`），
+`a:ea` 必须紧跟 `a:latin`，`append` 到末尾会被判非法。
+
+## A7. 用 `**文字**` 做强调标记 → YAML 直接扫描失败
+
+```
+- **异构协同性**：一个任务通常由多类资源……
+  ^
+ScannerError: while scanning an alias, expected alphabetic or numeric character
+```
+
+YAML 把行首 `**` 当成别名（anchor/alias）符号。
+中文稿里"列表项以加粗词开头"是极常见的写法，所以这个坑必踩。
+
+换成 `〔文字〕`（中文方头括号，输入法可直接打），在 YAML 任何位置都安全。
+渲染器同时兼容 `**` 和 `==`，但文档只推荐 `〔〕`。
+
+## A8. 控制台 GBK 打不出 `✓`
+
+现象：文件已经生成好了，最后一行 `print("✓ 已生成")` 抛
+`UnicodeEncodeError: 'gbk' codec can't encode character '✓'`，
+整个进程非零退出，看起来像"生成失败"。
+
+对策：统一用 ASCII 标记 `[OK]` / `[!]`，并把 stdout/stderr 设成
+`errors="replace"` 兜底（见 `scripts/_console.py`）。
+
+## A9. 单行文字被按段落行距误判溢出
+
+校验器用"行数 × 字号 × 行距"估高度。但单行文本的实际高度是字体自身行高
+（约 1.2em），和 `line_spacing` 无关。54pt 的「目录」按 1.5 倍算就
+被误报成溢出。
+
+```python
+eff = spacing if n > 1 else 1.2
+```
+
+## A10. 组合缩放系数没算，坐标校验全错
+
+组合内子形状的 `left/width` 是**子坐标系**的值。封面「汇报人」在母版里
+只有 2.31in 宽，但所在组合横向缩放 2.87 → 实际画出来 6.78in。
+不乘这个系数，会把本来放得下的文字全判成溢出。
+
+```python
+xfrm = group._element.find(".//" + qn("a:xfrm"))
+sx = int(xfrm.find(qn("a:ext")).get("cx")) / int(xfrm.find(qn("a:chExt")).get("cx"))
+```
+
+## A11. `Slide` 没有 `.rels`，是 `.part.rels`
+
+小事，但报错信息（`'Slide' object has no attribute 'rels'`）会把人往
+"是不是要用 `slide.part.rels`"以外的地方带。
+
+---
+
+# B. PowerShell COM 路线（旧版，仍然有效）
 
 > 场景：Windows + Windows PowerShell 5.1 + 已装 Microsoft PowerPoint（Office16），
 > **无网络**（pip / pywin32 都装不了），需要用代码批量生成一份**含中文**的 .pptx。
@@ -90,6 +289,7 @@ $pres.Close(); $app.Quit()
 ```
 
 - 导出的文件名是本地化的（中文系统下叫 `幻灯片1.PNG`…），别假设是 `Slide1.png`。
+  **新版 `export_png.ps1` 显式指定 `s01.png`** 就是为了绕开这个。
 - **注意**：低分辨率缩略图里形近字容易看走眼（本次把正确的"硬拦截"误判成"硬兰截"）。要判定是不是错别字，**回源脚本 `Grep` 确认**，不要只凭缩略图下结论。
 
 ---
@@ -153,13 +353,23 @@ ScaleFonts $g $scale                 # ← 关键：字号同步缩
 
 ---
 
-## 7. 一句话 checklist（下次照做）
+## 7. 一句话 checklist
 
-1. 探测 python-pptx / pywin32 / soffice / POWERPNT，决定路线。
-2. 用 PowerShell COM；脚本每次执行前**重写为 UTF-8 BOM**。
-3. 所有 COM 赋值：颜色/对齐/枚举 `[int]`，磅值/字号 `[single]`，布尔 `-1/0`。
-4. 枚举值查准（VerticalAnchor 无 2）。
-5. 生成后**导出 PNG 逐页看**；疑似错别字回源 `Grep` 核对。
-6. 结束 `ReleaseComObject` + `Quit`。
-7. **搬别人给的整页图**：先 dump 组内所有文本再按实际文本写 `Replace`；`Group` 等比缩放后**必须递归同步缩字号**（外框缩、字号不缩）；改文字后**立刻回写字号**；"整页图塞进保留标题+横幅的窄条"会糊，放法先问用户。
-8. **全局改字号**（如 +2 号）要递归进组内子形状**和表格每个单元格**（表格 `Type=19` 走 `Table.Cell().Shape`），普通遍历漏掉它们。改前先备份，改后逐页看有无溢出。
+**python-pptx 路线（主）**
+1. 删页 → 清 `p14:sectionLst`；删形状 → 先删 `p:timing`。
+2. 克隆形状 → 剥 `p:custDataLst`（tag 引用会撞 rId，且校验查不出）。
+3. 页码占位符 `type="sldNum"` 要显式复制；内容占位符不要复制。
+4. 找形状要**递归穿透 group**；找不到要**报警**，别静默返回 None。
+5. 中文 run 要带 `a:ea charset="-122"` 和 `rPr lang="zh-CN"`。
+6. YAML 里用 `〔〕` 标强调，别用 `**`。
+7. 生成后必导出 PNG 逐页看。
+
+**PowerShell COM 路线（旧）**
+8. 探测 python-pptx / pywin32 / soffice / POWERPNT，决定路线。
+9. 脚本每次执行前**重写为 UTF-8 BOM**。
+10. 所有 COM 赋值：颜色/对齐/枚举 `[int]`，磅值/字号 `[single]`，布尔 `-1/0`。
+11. 枚举值查准（VerticalAnchor 无 2）。
+12. **搬别人给的整页图**：先 dump 组内所有文本再按实际文本写 `Replace`；
+    `Group` 等比缩放后**必须递归同步缩字号**；改文字后**立刻回写字号**。
+13. **全局改字号**要递归进组内子形状**和表格每个单元格**（表格 `Type=19`
+    走 `Table.Cell().Shape`）。

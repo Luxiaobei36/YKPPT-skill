@@ -1,0 +1,5 @@
+﻿__pycache__/
+*.pyc
+renders/
+*.pptx
+!ykppt/assets/*.pptx

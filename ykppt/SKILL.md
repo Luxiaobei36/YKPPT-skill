@@ -1,60 +1,158 @@
 ---
 name: ykppt
 description: >-
-  用 Windows PowerShell + PowerPoint COM 在无网络环境批量生成/编辑含中文的学术风格
-  .pptx（封面、分节页眉、卡片、表格、框架图搬运与术语替换、全局改字号）。当需要在
-  Windows 上不依赖 python-pptx / pywin32 / LibreOffice 生成或修改中文 PPT、
-  或把外来整页框架图塞进已有模板页时，使用本 skill。
+  生成 / 修改西工大（NPU）组会与答辩风格的学术 PPT：深蓝五边形页眉、斜切横幅标题、
+  一页一论点的定性句、底部结论条、目录兼章节过渡页。用 python-pptx 从 YAML 大纲
+  批量生成，再用 PowerPoint COM 导出 PNG 逐页目视校验。当需要按模板做中文学术汇报
+  PPT、统一现有 PPT 的版式与字号、或从零起草一份组会稿时使用。
 ---
 
-# ykppt — 无网络中文学术 PPT 生成 skill
+# ykppt — 西工大学术 PPT 生成 skill
 
-> 沉淀自一次真实任务：把本科答辩 PPT 改造成会议口头报告，并把用户自制的整页框架图
-> 搬进模板页、统一术语、全局调字号。核心手段是 **Windows PowerShell 直接驱动
-> PowerPoint COM**，因为目标机器 **无网络**（`pip` 装不了 python-pptx / pywin32），
-> 也没有 LibreOffice `soffice`。
+> 沉淀自 4 份真实组会/答辩稿（20260415 / 20260716 / 20260731 / 多主体跨域协同，
+> 共 105 页），把其中反复出现但**互相矛盾的写法收敛成一套自洽规范**，
+> 再用「净化母版 + 渲染引擎 + 静态校验 + 目视校验」把规范固化成可执行的东西。
 
 ## 何时用
 
-- 目标平台是 **Windows + 已装 Microsoft PowerPoint**，但 **无网络 / 无 python-pptx / 无 pywin32 / 无 soffice**。
-- 要生成或修改**含中文**的 `.pptx`：封面、分节页、卡片、表格、KPI 数字块。
-- 要把**别人给的整页框架图**搬进你的模板页、替换其中术语、按目标版面缩放。
-- 要**全局调整字号**（如"所有字 +2 号"）而不破坏排版。
+- 要按西工大组会/答辩模板出一份中文 PPT（封面、目录、研究背景、相关工作、研究内容、总结展望）。
+- 手上已有一份 PPT，要**统一版式**：横幅字号、正文字体、结论条位置、页码格式。
+- 要把一篇论文/工作报告压缩成"一页一论点"的口头汇报。
+- 需要跨页复用同一套页眉页脚，但不想每次手画。
 
-## 铁律（每次照做，顺序不能省）
+## 目录
 
-1. **先探测环境**：`python-pptx / pywin32 / soffice / POWERPNT.EXE` 四者，决定路线。无网络几乎注定走 PowerShell + PowerPoint COM。
-2. **中文 .ps1 必须 UTF-8 带 BOM**：本仓库/多数编辑器写出的是无 BOM UTF-8，PowerShell 5.1 会按 ANSI 解码 → 中文全乱码。**每次改完脚本、执行前，重写为 BOM**（见 `scripts/run_ps1.ps1`）。
-3. **COM 属性显式强转**：颜色/对齐/枚举 → `[int]`；磅值/字号 → `[single]`；布尔 → `-1/0`（不是 `$true/$false`）。
-4. **枚举值查准**：`VerticalAnchor` 只有 Top=1 / Middle=3 / Bottom=4（**没有 2**）；段落对齐左=1/中=2/右=3；`AddShape` 矩形=1/圆角=5；`SaveAs(...,24)`=.pptx。
-5. **颜色是 BGR 打包整数**：`RGB = R + G*256 + B*65536`，用 `RGBv` 函数别手算。
-6. **生成/改完必须导出 PNG 逐页目视检查**：SaveAs 成功 ≠ 排版正确。溢出、重叠、乱码只有看图才知道。导出文件名本地化（中文系统是 `幻灯片1.PNG`）。
-7. **收尾** `ReleaseComObject` + `Quit`，否则残留 `POWERPNT` 进程。
+```
+ykppt/
+├─ SKILL.md                  本文件：流程 + 铁律
+├─ assets/
+│  └─ ykppt-template.pptx    净化母版（5 张页型样板页，2.7MB，无姓名无正文）
+├─ scripts/
+│  ├─ build_deck.py          主入口：YAML → .pptx
+│  ├─ ykrender.py            渲染引擎（页型渲染器 + 母版克隆）
+│  ├─ verify_deck.py         静态校验（越界/字号/字体/字数/溢出/页码）
+│  ├─ export_png.py          PowerPoint COM 导出 PNG
+│  ├─ export_png.ps1         ↑ 的 PowerShell 实现（无 pywin32 时用）
+│  ├─ _console.py            控制台编码兜底（GBK 终端）
+│  └─ com/                   旧版纯 COM 脚本（搬整页图 / 全局改字号），仍可用
+├─ references/
+│  ├─ style.md               设计 token：画布、色板、字号阶梯、行距、坐标
+│  ├─ archetypes.md          页型配方：10 种页型的精确坐标与容量
+│  └─ pitfalls.md            踩坑清单（含最小复现）
+└─ examples/
+   └─ deck.yaml              完整示例大纲，直接改字即可用
+```
 
-## 搬运"整页框架图"的专门流程（本 skill 的重头）
+## 快速上手
 
-别人给的框架图常按**占满整页**设计（字号统一、形状铺满 960×540）。直接缩进"保留标题+横幅"的窄条会**糊成一团**。按下面来：
+```bash
+pip install python-pptx pyyaml pillow
 
-1. **先 dump** 目标图（通常是单独一页）里所有形状的文本与几何，按**实际文本**写替换键，别照记忆猜。
-2. **术语替换**：读旧字号 → `TextRange.Text=新词` → **立刻回写字号和中文字体**（`Text=` 后 COM 会重置 run 字号/字体）。
-3. **确认放法**（先问用户，别默认）：
-   - 图占满整页（推荐）：只留 section 标签 + 大标题，横幅精简成标题下一行小字，图铺 `x45..915 / y142..498`。
-   - 保标题+横幅、图缩中间：最省事但图明显变小。
-   - 图单独成一页：效果最好但总页数 +1。
-4. **组合 → 复制 → 粘贴到目标页**：`Shapes.Range().Group()` → `Copy()` → 目标页 `Paste()`。
-5. **等比缩放 + 同步缩字号**：`Group` 缩 `Width/Height` 只缩外框，**组内文本字号不变** → 必须递归把每个子形状字号 ×同一系数（见 `scripts/insert_figure.ps1` 的 `ScaleFonts`）。不同步就会换行溢出重叠。
-6. **删原图页**，导出目标页 PNG 核对。
+# 从示例开始
+python scripts/build_deck.py examples/deck.yaml -o out.pptx --verify --export renders/
+```
 
-## 全局改字号
+`--export` 会调 PowerPoint 导出每页 PNG。**必须逐页看**，见铁律 5。
 
-- "所有字 +N 号"要**递归进组内子形状**，还要**遍历表格每个单元格**（表格 `Type=19`，走 `Table.Cell(r,c).Shape.TextFrame`，普通遍历碰不到单元格），否则组里/表里的字被漏。
-- 改前**备份**，改后**逐页导出核对**有无溢出。见 `scripts/bump_font.ps1`。
+## 工作流程（照顺序做）
 
-## 文件
+### 1. 先定"一页一论点"
 
-- `scripts/run_ps1.ps1` — 把任意 .ps1 重写为 UTF-8 BOM 再执行（每次跑脚本的入口）。
-- `scripts/ppt_helpers.ps1` — 可 dot-source 的公共函数：`RGBv / Add-Text / Add-Box / Add-Bar / NL / New-Slide`。
-- `scripts/insert_figure.ps1` — 搬运整页图模板：术语替换 + 删旧中间区 + 组合搬运 + 等比缩放 + **同步缩字号** + 删原图页。
-- `scripts/bump_font.ps1` — 全局字号 +N（含组内与表格单元格）。
-- `scripts/export_check.ps1` — 导出指定页/全篇为 PNG 供目视检查。
-- `references/pitfalls.md` — 完整踩坑清单（含最小复现与排错法）。
+每页只回答一个问题，四件套缺一不可：
+
+| 字段 | 作用 | 容量 |
+|---|---|---|
+| `section` | 章标签（一、研究背景） | ≤ 6 字 |
+| `title` | 横幅标题，**一句断言**而非名词短语 | ≤ 26 字 |
+| `lead` | 标题下 20pt 粗的定性句，本页结论 | ≤ 60 字 |
+| `conclusion` | 底部结论条，一句话收束 | ≤ 52 字 |
+
+> `title` 写"亲和性与局部性"是名词，写"亲和性判断能不能配，局部性判断贵不贵"
+> 才是断言。后者让听众不用听讲解也知道这一页要说什么。
+
+### 2. 选页型
+
+见 `references/archetypes.md` 的决策表。速查：
+
+| 内容 | type |
+|---|---|
+| 一句话结论 + 两个并排对照 | `cards` |
+| 3–5 条并列理由 | `bullets` |
+| 方法 3 步递进 | `flow` |
+| 方法 4–5 步 | `flow_h` |
+| 系统/指标对比 | `table` |
+| 自绘大框架图 | `image` |
+| 只有一句重要的话 | `lead` |
+| 进入新章 | `toc` + `current: 章名` |
+
+### 3. 写 YAML
+
+照 `examples/deck.yaml` 改。强调语法：
+
+- `〔文字〕` → 加粗深红 `#C00000`（正文里的关键短语）
+- `==文字==` → 高亮红 `#FF0000`（被否定/警示的结论）
+
+> **不要用 `**加粗**`**：YAML 会把行首 `**` 当别名符号，直接扫描失败。
+> `〔〕` 在 YAML 任何位置都安全，输入法可直接打出。
+
+### 4. 生成 + 校验
+
+```bash
+python scripts/build_deck.py deck.yaml --verify --export renders/
+```
+
+`--verify` 报的每一条都要处理。常见：
+
+| 警告 | 处理 |
+|---|---|
+| 横幅标题超过 26 字 | 缩写，别缩字号（缩了和其他页不齐） |
+| 结论条超过 52 字 | 拆成两页，或删掉状语 |
+| 卡片正文溢出 | 减字，或把 2 卡改 1 卡纵排 |
+| lead 折成 3 行 | 拆页 |
+
+### 5. 逐页看 PNG
+
+`renders/s01.png …` 逐张打开。**这一步不能省**（铁律 5）。
+看四件事：有没有压线/重叠、图片有没有丢、字体有没有回退、中文有没有被拆行。
+
+## 铁律
+
+1. **不要重画页眉**。五边形、校徽、斜切横幅、页脚渐变都在 slideLayout 里，
+   克隆母版页即可继承。用代码画会立刻和原稿不齐。
+2. **配色只用 `style.md` §2 的语义色**。白底上别用黄字（`#FFFF00` 只配红底气泡）。
+3. **字体只有微软雅黑 + Arial**。`黑体` / `思源黑体 CN` / `+mn-ea` 都已废弃——
+   原 4 份稿混用这 4 种，行高不一致，肉眼能看出页间不齐。
+4. **字号只用阶梯内的值**（见 `style.md` §4）。要更大的字就改版面，不要发明 22pt。
+5. **生成完必须导出 PNG 逐页看**。`SaveAs` 成功 ≠ 排版正确。
+6. **一页一个论点**。结论条空着或写成"本节介绍了……"，说明这页还没想清楚。
+7. **改母版要同步改代码与规范**。`style.md` 的数值、`ykrender.py` 的常量、
+   `assets/ykppt-template.pptx` 三者是一套，动一个就要动另外两个。
+
+## 常见任务
+
+### 把现成的旧 PPT 统一到本规范
+
+1. `export_png.py old.pptx old_render/` 看清现状。
+2. 按页把内容抄进 YAML（不需要重画图，图直接 `image:` 引用导出图或原图）。
+3. 用本规范重排，逐页比对。
+
+### 只改字号 / 只搬一张整页图
+
+这两个用 `scripts/com/` 里的旧脚本更快（`bump_font.ps1` / `insert_figure.ps1`），
+它们直接驱动 PowerPoint COM，适合"只动一处、其余不碰"的场景。
+注意里面的 UTF-8 BOM 要求，见 `pitfalls.md` §1。
+
+### 换学校 / 换模板
+
+母版是 5 张页型样板页，形状用 `yk_*` 角色名定位（`yk_title`、`yk_section`、
+`yk_concl_text` …）。换模板时重新做一份样板页并按同一套角色名命名，
+`ykrender.py` 不用改。
+
+## 已知边界
+
+- 页型只有 10 种，**没有**：时间轴、组织架构图、多图拼贴、代码块。
+  这些请自绘成 PNG 走 `image:` 页型。
+- `flow` 竖向最多 3 步（4 步会超出画布），4–5 步用 `flow_h`。
+- 表格最多 3 列 6 行；更复杂的表格请截图走 `image:`。
+- 文字溢出是**估算**（Pillow 测字宽），不是 PowerPoint 真实排版结果。
+  所以静态校验通过 ≠ 一定没问题，仍然要看图。
